@@ -203,9 +203,11 @@ The `test_parser.py` suite includes:
 
 ## 5. Parser Design
 
-The markdown parser splits the document line-by-line while maintaining a **heading parent stack** to preserve nesting relations:
+The markdown parser in `app/parser/markdown_parser.py` splits the document line-by-line while maintaining a **heading parent stack** to preserve nesting relations:
+
+### Core Algorithm
 1. **Heading Detection**: A regular expression `^(#{1,6})(?:\s+(.*)|$)` matches level 1–6 headings.
-2. **Heading Cleansing**: Leading number prefixes (like `1.`, `2.1.1`) and markdown syntax (such as bold asterisks `**`) are stripped out for comparison stability, while raw titles are preserved in SQLite.
+2. **Heading Cleansing**: The `clean_heading_text()` function strips markdown bold markers (`**`, `*`, backticks) and leading/trailing whitespace from heading text for comparison stability.
 3. **Hierarchy Stack Management**:
    - When a heading of level $L$ is encountered, the parser pops headings off the parent stack until the top heading's level is less than $L$.
    - The node at the top of the stack becomes the new heading's `parent_id`.
@@ -213,13 +215,24 @@ The markdown parser splits the document line-by-line while maintaining a **headi
 4. **Paragraph Preservation**:
    - Content following a heading is accumulated in that node's `text_lines` until another heading is matched.
    - All formatting, such as tables, bullet lists, and code blocks, is fully preserved without alterations.
-5. **Edge Cases**:
-   - **Duplicate Headings**: Supported since each node is assigned a distinct UUID.
-   - **Empty Headings** (e.g., `##### `): Parsed as level 5 headings with `heading=""`.
-   - **Intro Text**: Any paragraph found before the first heading is appended to a virtual `Intro` node.
+5. **Virtual Intro Node**: 
+   - Any paragraph found before the first heading is appended to a virtual `Intro` node with level 1.
+   - This node is only added to the node tree if it contains non-empty content.
 6. **Determinism**:
-   - Node hash is computed as `SHA256(heading + "\n" + text)`.
+   - Node hash is computed as `SHA256(heading + "\n" + text)` using the full heading and body text.
    - A sequential `sort_order` integer is stored with each node to guarantee that text can be reconstructed in the exact document order.
+
+### Implementation Details
+- **UUID Generation**: Each node receives a unique UUID via `uuid.uuid4()` to handle duplicate headings gracefully.
+- **Content Hashing**: The hash input concatenates heading and text with a newline separator: `f"{node['heading']}\n{node['text']}"`.
+- **Line Processing**: The parser processes documents line-by-line, maintaining state through the `current_node` reference and `stack` structure.
+- **Empty Document Handling**: If a document has no headings but contains text, a single virtual Intro node captures all content.
+
+### Edge Case Handling
+- **Duplicate Headings**: Supported since each node is assigned a distinct UUID.
+- **Empty Headings** (e.g., `##### `): Parsed as level 5 headings with `heading=""` after cleansing.
+- **No Heading Documents**: Entire document content is captured in a virtual Intro node.
+- **Orphan Paragraphs**: Any text after the last heading is attached to the last active heading node.
 
 ---
 
@@ -254,14 +267,19 @@ The staleness checker guarantees that old test case generations do not drift sil
 
 ### LLM Prompt Design
 The Groq prompt sets up strict instructions for the LLM:
-- **Role**: Expert QA Engineer.
+- **Role**: Expert QA Engineer specializing in medical device software testing.
 - **Rules**: Return ONLY valid JSON matching the Pydantic schema structure. No markdown formatting, no text before or after.
 - **Test Case Fields**: unique ID, title, requirement reference, preconditions, steps array, expected result, priority, risk level, and category.
+- **Constraints**: Generate between 3 and 5 test cases per selection to ensure focused coverage.
+- **Temperature**: Set to 0.3 for deterministic, consistent outputs.
+- **Max Tokens**: Limited to 4096 to control costs and response length.
 
 ### Failure Handling & Fallbacks
 1. **Model Fallback Chain**: Wires up an automatic fallback sequence: `llama-3.3-70b-versatile` $\rightarrow$ `llama3-70b-8192` $\rightarrow$ `llama3-8b-8192` $\rightarrow$ `mixtral-8x7b-32768`. If the primary model fails or is rate-limited, it automatically falls back.
-2. **Single Parsing Retry**: If the response is not valid JSON or fails Pydantic schema validation, the client captures the error, appends it to the prompt as feedback, and sends a single retry command.
-3. **Raw Response Storage**: If the retry still fails, the system inserts the failed run into MongoDB with `status="FAILED"`, saving the raw text and exception logs for developer review, and raises a `502 Bad Gateway` API error.
+2. **Single Parsing Retry**: If the response is not valid JSON or fails Pydantic schema validation, the client captures the error, appends it to the prompt as feedback, and sends a single retry command with the error context injected.
+3. **Code Fence Handling**: The parser automatically strips markdown code fences (```) if the LLM wraps JSON in them, handling a common LLM output pattern.
+4. **Raw Response Storage**: If the retry still fails, the system inserts the failed run into MongoDB with `status="FAILED"`, saving the raw text and exception logs for developer review, and raises a `502 Bad Gateway` API error.
+5. **Connectivity Check**: A dedicated health check function uses the lightweight `llama3-8b-8192` model to verify API key validity and connectivity without incurring significant costs.
 
 ---
 
