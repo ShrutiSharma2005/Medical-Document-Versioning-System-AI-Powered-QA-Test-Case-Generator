@@ -42,17 +42,33 @@ pip install -r requirements.txt
 ### 4. Configuration (`.env`)
 Copy the template `.env.example` into a new `.env` file:
 ```bash
-cp .env.example .env
+cp .env.example .env     # On Unix/macOS
+copy .env.example .env   # On Windows
 ```
 Open `.env` and fill in your details:
 ```ini
-LOG_LEVEL=INFO
-DATABASE_URL=sqlite+aiosqlite:///./tri9t_ai.db
-MONGO_URI=mongodb://localhost:27017
-MONGO_DB_NAME=tri9t_ai
-MONGO_COLLECTION=generated_testcases
-GROQ_API_KEY=your-actual-groq-api-key
+# Application Settings
+LOG_LEVEL=INFO                    # Logging verbosity: DEBUG, INFO, WARNING, ERROR
+
+# SQLite Database Settings
+DATABASE_URL=sqlite+aiosqlite:///./tri9t_ai.db    # Database file location
+
+# MongoDB Settings
+MONGO_URI=mongodb://localhost:27017              # MongoDB connection string
+MONGO_DB_NAME=tri9t_ai                           # Database name
+MONGO_COLLECTION=generated_testcases             # Collection for test case generations
+
+# Groq LLM API Settings
+GROQ_API_KEY=your-actual-groq-api-key            # Get from https://console.groq.com/keys
 ```
+
+**Environment Variable Details:**
+- **LOG_LEVEL**: Controls application logging verbosity. Use `DEBUG` for development, `INFO` for production.
+- **DATABASE_URL**: SQLite database file path. The `aiosqlite` driver enables async operations.
+- **MONGO_URI**: MongoDB connection string. For local MongoDB, use `mongodb://localhost:27017`. For MongoDB Atlas, use your connection string.
+- **MONGO_DB_NAME**: Database name in MongoDB for storing generated test cases.
+- **MONGO_COLLECTION**: Collection name within the database for test case documents.
+- **GROQ_API_KEY**: Required for LLM test case generation. Obtain from Groq console.
 
 ### 5. Start MongoDB
 Make sure MongoDB is running and accessible. You can connect to a local MongoDB instance (installed directly on your machine) or a remote MongoDB Atlas database by updating the `MONGO_URI` variable in your `.env` file.
@@ -90,15 +106,47 @@ Once started, you can access:
 
 The application comes with a comprehensive test suite covering the parser, hybrid matcher, selection service, LLM wrapper, and staleness engine.
 
+### Running All Tests
 Run all tests in isolation using in-memory SQLite:
 ```bash
 pytest -v
 ```
 
-To check coverage:
+### Running Specific Test Suites
 ```bash
-pytest --cov=app tests/
+# Parser tests (markdown parsing edge cases)
+pytest tests/test_parser.py -v
+
+# Versioning tests (matching algorithm and diff generation)
+pytest tests/test_versioning.py -v
+
+# Selection service tests (CRUD and text reconstruction)
+pytest tests/test_selection_service.py -v
+
+# Staleness detection tests
+pytest tests/test_staleness.py -v
+
+# LLM integration tests (requires valid GROQ_API_KEY)
+pytest tests/test_llm.py -v
+
+# Document service tests (upload and re-ingestion workflows)
+pytest tests/test_document_service.py -v
 ```
+
+### Coverage Report
+Generate a detailed coverage report:
+```bash
+pytest --cov=app tests/ --cov-report=html
+```
+This creates an `htmlcov/` directory with an interactive HTML report showing line-by-line coverage.
+
+### Test Configuration
+Tests use pytest-asyncio for async database operations and automatically use in-memory SQLite for isolation. No test database setup is required.
+
+### LLM Testing Notes
+- LLM tests require a valid `GROQ_API_KEY` in your `.env` file
+- These tests make actual API calls to Groq and may incur costs
+- To skip LLM tests: `pytest tests/ -v -k "not llm"`
 
 ---
 
@@ -240,6 +288,68 @@ curl -X GET "http://127.0.0.1:8000/api/v1/generated/sel-1002-3004"
   "test_cases": [...]
 }
 ```
+
+---
+
+## � Triggering V1 → V2 Re-ingestion Flow
+
+The re-ingestion flow is specifically designed to handle document version updates while maintaining traceability of test case staleness. Here's the step-by-step process:
+
+### Prerequisites
+1. **Version 1 must already exist**: You must have previously uploaded a document using the `/documents/upload` endpoint
+2. **Have the Document ID**: Keep track of the `document_id` from the initial upload response
+3. **Prepare Version 2**: Have the revised markdown file ready (e.g., `ct200_manual_v2.md`)
+
+### Re-ingestion Steps
+
+#### Step 1: Upload Version 2
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/documents/reingest" \
+  -F "document_id=8c4ab17a-5b12-4fb2-9e8c-85a22d51dcfb" \
+  -F "file=@../ct200_manual_v2.md"
+```
+
+**What happens internally:**
+- System fetches all V1 nodes from SQLite
+- Parses V2 markdown into new node tree
+- Runs hybrid matching algorithm to compare V1 vs V2 nodes
+- Creates Version 2 record with new nodes
+- Stores comparison results and node mappings
+- **Automatically marks stale** any test case generations that reference modified nodes
+
+#### Step 2: Review Comparison Results
+The response includes:
+- `new_version_id`: UUID for the newly created Version 2
+- `comparison_summary`: Counts of added/modified/unchanged/deleted nodes
+- `stale_generations_marked`: Number of test case generations marked as stale
+
+#### Step 3: Check Stale Generations
+```bash
+curl -X GET "http://127.0.0.1:8000/api/v1/generated"
+```
+
+This lists all generations with their staleness status. Generations marked as `STALE` will include:
+- `stale_reason`: Which sections changed since generation
+- `staleness_info`: Detailed diff summaries and changed headings
+
+#### Step 4: Regenerate Test Cases (Optional)
+For stale generations, you can trigger regeneration:
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/generated" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "selection_id": "sel-1002-3004"
+  }'
+```
+
+This will create a new generation based on the latest document version, automatically updating the version reference.
+
+### Key Behaviors
+- **Version Lineage**: Each re-ingestion creates a sequential version (V1 → V2 → V3)
+- **Node Mapping**: The system tracks how each node changed between versions
+- **Automatic Staleness**: Test cases are marked stale without manual intervention
+- **Comparison Persistence**: All version comparisons are stored for audit trails
+- **Selection Version Pinning**: Original selections remain pinned to their creation version
 
 ---
 
